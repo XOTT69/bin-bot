@@ -43,25 +43,25 @@ async function lookupBin(bin) {
 
   let resultData = null;
 
-  // АПІ №1: binlist.net (найкраще, але жорсткі ліміти)
+  // АПІ №1: binlist.net
   try {
     const res = await fetch(`https://lookup.binlist.net/${bin}`, { headers: { 'Accept-Version': '3' } });
-    if (res.status === 404) return null; // Точно немає в базі
     if (res.ok) {
       resultData = await res.json();
-      console.log('Дані отримано з API 1 (binlist.net)');
+      console.log('API 1 (binlist.net) OK');
     }
   } catch (e) {
-    console.log('API 1 недоступне, пробуємо API 2...');
+    console.log('API 1 Fail');
   }
 
-  // АПІ №2: freebinchecker.com (резерв №1)
-  if (!resultData) {
+  // АПІ №2: freebinchecker.com
+  if (!resultData || Object.keys(resultData).length === 0) {
     try {
       const res = await fetch(`https://api.freebinchecker.com/bin/${bin}`);
       if (res.ok) {
         const raw = await res.json();
-        if (raw.valid) {
+        // Перевіряємо, чи дійсно є дані, а не просто заглушка
+        if (raw.valid && (raw.card || raw.issuer || raw.country)) {
           resultData = {
             scheme: raw.card?.scheme || raw.scheme,
             type: raw.card?.type || raw.type,
@@ -70,23 +70,22 @@ async function lookupBin(bin) {
             country: { name: raw.country?.name, alpha2: raw.country?.alpha2 },
             bank: { name: raw.issuer?.name || raw.bank?.name, url: raw.issuer?.url || raw.bank?.url, phone: raw.issuer?.phone || raw.bank?.phone }
           };
-          console.log('Дані отримано з API 2 (freebinchecker.com)');
-        } else {
-          return null; // Точно немає в базі
+          console.log('API 2 (freebinchecker) OK');
         }
       }
     } catch (e) {
-      console.log('API 2 недоступне, пробуємо API 3...');
+      console.log('API 2 Fail');
     }
   }
 
-  // АПІ №3: bininfo.io (резерв №2)
-  if (!resultData) {
+  // АПІ №3: bininfo.io
+  if (!resultData || Object.keys(resultData).length === 0) {
     try {
       const res = await fetch(`https://bininfo.io/bin/${bin}`);
       if (res.ok) {
         const raw = await res.json();
-        if (raw.bin) {
+        // Перевіряємо, чи повернулася валідна схема або банк
+        if (raw.bin && (raw.scheme || raw.bank_name || raw.country_code)) {
           resultData = {
             scheme: raw.scheme,
             type: raw.type,
@@ -95,19 +94,22 @@ async function lookupBin(bin) {
             country: { name: raw.country_name, alpha2: raw.country_code },
             bank: { name: raw.bank_name, url: raw.bank_url, phone: raw.bank_phone }
           };
-          console.log('Дані отримано з API 3 (bininfo.io)');
+          console.log('API 3 (bininfo) OK');
         }
       }
     } catch (e) {
-      console.error('Усі 3 API недоступні!');
-      throw new Error('API Servers down');
+      console.error('API 3 Fail');
     }
   }
 
-  if (resultData) {
-    cache.set(bin, { ts: now, data: resultData });
+  // Якщо всі 3 API відпрацювали, але даних так і немає:
+  if (!resultData || Object.keys(resultData).length === 0 || (!resultData.scheme && !resultData.bank)) {
+    // НЕ зберігаємо в кеш, щоб при наступному запиті бот спробував ще раз
+    return null; 
   }
 
+  // Якщо дані є - зберігаємо в пам'ять
+  cache.set(bin, { ts: now, data: resultData });
   return resultData;
 }
 
@@ -149,7 +151,7 @@ const replyToUser = async (ctx, text) => {
   
   try {
     const data = await lookupBin(bin);
-    if (!data) return ctx.reply('❌ BIN не знайдено в базі даних.');
+    if (!data) return ctx.reply('❌ BIN не знайдено в базі даних (або ліміти всіх API вичерпано).');
     return ctx.replyWithMarkdown(format(bin, data));
   } catch (error) {
     return ctx.reply('⚠️ Помилка з\'єднання з серверами. Спробуйте пізніше.');
@@ -169,6 +171,7 @@ bot.on('text', ctx => {
   }
 });
 
+// Запуск бота
 bot.launch().then(() => console.log('🤖 Бот успішно запущений!'));
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
