@@ -10,82 +10,118 @@ if (!process.env.BOT_TOKEN) {
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const cache = new Map();
-const CACHE_TTL = 24 * 60 * 60 * 1000; // Кешування результатів на 1 день
+const CACHE_TTL = 24 * 60 * 60 * 1000; // Кешування на 1 день
 
 // --- Словники для перекладу ---
 const tr = {
-  types: {
-    debit: 'Дебетова',
-    credit: 'Кредитна',
-    charge: 'Charge',
-    prepaid: 'Передплачена'
-  },
-  schemes: {
-    visa: 'Visa',
-    mastercard: 'Mastercard',
-    amex: 'American Express',
-    discover: 'Discover',
-    jcb: 'JCB',
-    unionpay: 'UnionPay'
-  },
-  yesNo: {
-    true: 'Так',
-    false: 'Ні'
-  }
+  types: { debit: 'Дебетова', credit: 'Кредитна', charge: 'Charge', prepaid: 'Передплачена' },
+  schemes: { visa: 'Visa', mastercard: 'Mastercard', amex: 'American Express', discover: 'Discover', jcb: 'JCB', unionpay: 'UnionPay' },
+  yesNo: { true: 'Так', false: 'Ні' }
 };
 
 // Функція перекладу країн (UA -> Україна)
 const getCountryName = (code) => {
   if (!code) return '—';
-  try {
-    return new Intl.DisplayNames(['uk'], { type: 'region' }).of(code);
-  } catch (e) {
-    return code; 
-  }
+  try { return new Intl.DisplayNames(['uk'], { type: 'region' }).of(code); } 
+  catch (e) { return code; }
 };
 
-// --- Основна логіка витягування BIN ---
+// --- Витягування BIN з тексту ---
 function extractBin(text) {
   if (!text) return null;
-  // Видаляємо команду /bin якщо вона є
   const raw = text.replace(/^\/bin(?:@\w+)?\s*/i, '');
-  // Залишаємо тільки цифри
   const digits = raw.replace(/\D/g, '');
   if (digits.length < 6) return null;
-  return digits.slice(0, 8); // Беремо максимум перші 8 цифр
+  return digits.slice(0, 8); 
 }
 
-// --- Запит до API ---
+// --- Послідовний запит до 3-х різних API ---
 async function lookupBin(bin) {
   const now = Date.now();
   const hit = cache.get(bin);
   if (hit && now - hit.ts < CACHE_TTL) return hit.data;
 
-  const res = await fetch(`https://lookup.binlist.net/${bin}`, {
-    headers: { 'Accept-Version': '3' }
-  });
-  
-  if (res.status === 404) return null;
-  if (!res.ok) throw new Error(`HTTP Error ${res.status}`);
-  
-  const data = await res.json();
-  cache.set(bin, { ts: now, data }); // Зберігаємо в пам'ять
-  return data;
+  let resultData = null;
+
+  // АПІ №1: binlist.net (найкраще, але жорсткі ліміти)
+  try {
+    const res = await fetch(`https://lookup.binlist.net/${bin}`, { headers: { 'Accept-Version': '3' } });
+    if (res.status === 404) return null; // Точно немає в базі
+    if (res.ok) {
+      resultData = await res.json();
+      console.log('Дані отримано з API 1 (binlist.net)');
+    }
+  } catch (e) {
+    console.log('API 1 недоступне, пробуємо API 2...');
+  }
+
+  // АПІ №2: freebinchecker.com (резерв №1)
+  if (!resultData) {
+    try {
+      const res = await fetch(`https://api.freebinchecker.com/bin/${bin}`);
+      if (res.ok) {
+        const raw = await res.json();
+        if (raw.valid) {
+          resultData = {
+            scheme: raw.card?.scheme || raw.scheme,
+            type: raw.card?.type || raw.type,
+            brand: raw.card?.category || raw.brand,
+            prepaid: raw.card?.prepaid || raw.prepaid,
+            country: { name: raw.country?.name, alpha2: raw.country?.alpha2 },
+            bank: { name: raw.issuer?.name || raw.bank?.name, url: raw.issuer?.url || raw.bank?.url, phone: raw.issuer?.phone || raw.bank?.phone }
+          };
+          console.log('Дані отримано з API 2 (freebinchecker.com)');
+        } else {
+          return null; // Точно немає в базі
+        }
+      }
+    } catch (e) {
+      console.log('API 2 недоступне, пробуємо API 3...');
+    }
+  }
+
+  // АПІ №3: bininfo.io (резерв №2)
+  if (!resultData) {
+    try {
+      const res = await fetch(`https://bininfo.io/bin/${bin}`);
+      if (res.ok) {
+        const raw = await res.json();
+        if (raw.bin) {
+          resultData = {
+            scheme: raw.scheme,
+            type: raw.type,
+            brand: raw.brand,
+            prepaid: raw.prepaid === 'Yes' ? true : (raw.prepaid === 'No' ? false : null),
+            country: { name: raw.country_name, alpha2: raw.country_code },
+            bank: { name: raw.bank_name, url: raw.bank_url, phone: raw.bank_phone }
+          };
+          console.log('Дані отримано з API 3 (bininfo.io)');
+        }
+      }
+    } catch (e) {
+      console.error('Усі 3 API недоступні!');
+      throw new Error('API Servers down');
+    }
+  }
+
+  if (resultData) {
+    cache.set(bin, { ts: now, data: resultData });
+  }
+
+  return resultData;
 }
 
-// --- Форматування відповіді (українською) ---
+// --- Форматування відповіді ---
 function format(bin, d) {
-  // Конвертуємо код країни у емодзі прапора
   const flag = d?.country?.alpha2
     ? String.fromCodePoint(...[...d.country.alpha2.toUpperCase()].map(c => 0x1F1E0 - 65 + c.charCodeAt(0)))
     : '';
 
-  const scheme = tr.schemes[d?.scheme] || d?.scheme || '—';
-  const type = tr.types[d?.type] || d?.type || '—';
+  const scheme = tr.schemes[d?.scheme?.toLowerCase()] || d?.scheme || '—';
+  const type = tr.types[d?.type?.toLowerCase()] || d?.type || '—';
   const brand = d?.brand || '—';
   const isPrepaid = tr.yesNo[d?.prepaid] || '—';
   
-  // Дані банку (якщо є в базі API)
   const bankName = d?.bank?.name || '—';
   const bankUrl = d?.bank?.url || '—';
   const bankPhone = d?.bank?.phone || '—'; 
@@ -116,7 +152,7 @@ const replyToUser = async (ctx, text) => {
     if (!data) return ctx.reply('❌ BIN не знайдено в базі даних.');
     return ctx.replyWithMarkdown(format(bin, data));
   } catch (error) {
-    return ctx.reply('⚠️ Помилка з\'єднання з сервером. Спробуйте пізніше.');
+    return ctx.reply('⚠️ Помилка з\'єднання з серверами. Спробуйте пізніше.');
   }
 };
 
@@ -126,23 +162,18 @@ bot.help(ctx => ctx.reply('Просто напиши в чат цифри BIN (�
 
 bot.command('bin', ctx => replyToUser(ctx, ctx.message.text));
 
-// Реакція на звичайний текст (якщо це цифри)
 bot.on('text', ctx => {
-  if (ctx.message.text.startsWith('/')) return; // ігноруємо інші команди
-  // Якщо в тексті є 6 або більше цифр підряд (з пробілами чи без)
+  if (ctx.message.text.startsWith('/')) return; 
   if (/(?:\d[ -]*?){6,}/.test(ctx.message.text)) {
     replyToUser(ctx, ctx.message.text);
   }
 });
 
-// Запуск бота
 bot.launch().then(() => console.log('🤖 Бот успішно запущений!'));
-
-// Безпечне вимкнення
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
 
-// ── Health-check сервер для Render (щоб не вибивало помилку) ──
+// Health-check для Render
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => res.end('Bot is running OK')).listen(PORT, () => {
   console.log(`🌐 Health check server is listening on port ${PORT}`);
