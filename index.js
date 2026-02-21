@@ -2,7 +2,7 @@ require('dotenv').config();
 const { Telegraf } = require('telegraf');
 const http = require('http');
 
-// Перевірка наявності токена
+// Перевірка наявності токена Telegram
 if (!process.env.BOT_TOKEN) {
   console.error('Помилка: Не знайдено BOT_TOKEN.');
   process.exit(1);
@@ -35,7 +35,7 @@ function extractBin(text) {
   return digits.slice(0, 8); 
 }
 
-// --- Послідовний запит до 3-х різних API ---
+// --- Послідовний запит до 4-х різних API ---
 async function lookupBin(bin) {
   const now = Date.now();
   const hit = cache.get(bin);
@@ -43,24 +43,80 @@ async function lookupBin(bin) {
 
   let resultData = null;
 
-  // АПІ №1: binlist.net
-  try {
-    const res = await fetch(`https://lookup.binlist.net/${bin}`, { headers: { 'Accept-Version': '3' } });
-    if (res.ok) {
-      resultData = await res.json();
-      console.log('API 1 (binlist.net) OK');
+  // АПІ №1: APILayer (Основний, працює з ключем)
+  if (process.env.APILAYER_KEY) {
+    try {
+      const res = await fetch(`https://api.apilayer.com/bincheck/${bin}`, {
+        method: 'GET',
+        headers: { 'apikey': process.env.APILAYER_KEY }
+      });
+      if (res.ok) {
+        const raw = await res.json();
+        if (raw.bin && raw.bank) {
+          resultData = {
+            scheme: raw.scheme,
+            type: raw.type,
+            brand: raw.brand,
+            prepaid: raw.prepaid === 'YES' ? true : (raw.prepaid === 'NO' ? false : null),
+            country: { name: raw.country?.name, alpha2: raw.country?.code },
+            bank: { name: raw.bank?.name, url: raw.bank?.url, phone: raw.bank?.phone }
+          };
+          console.log(`[${bin}] Знайдено через APILayer`);
+        }
+      } else {
+        console.log(`[${bin}] APILayer Fail: HTTP ${res.status}`);
+      }
+    } catch (e) {
+      console.log(`[${bin}] APILayer Request Fail`);
     }
-  } catch (e) {
-    console.log('API 1 Fail');
   }
 
-  // АПІ №2: freebinchecker.com
+  // АПІ №2: API Ninjas (Резерв з ключем)
+  if (!resultData && process.env.NINJA_API_KEY) {
+    try {
+      const res = await fetch(`https://api.api-ninjas.com/v1/binlookup?bin=${bin}`, { 
+        headers: { 'X-Api-Key': process.env.NINJA_API_KEY } 
+      });
+      if (res.ok) {
+        const raw = await res.json();
+        if (raw.valid && raw.bank) {
+          resultData = {
+            scheme: raw.scheme,
+            type: raw.type,
+            brand: raw.brand,
+            prepaid: raw.prepaid === 'yes' ? true : (raw.prepaid === 'no' ? false : null),
+            country: { name: raw.country, alpha2: raw.country_code },
+            bank: { name: raw.bank, url: raw.bank_url, phone: raw.bank_phone }
+          };
+          console.log(`[${bin}] Знайдено через API Ninjas`);
+        }
+      } else {
+        console.log(`[${bin}] API Ninjas Fail: HTTP ${res.status}`);
+      }
+    } catch (e) {
+      console.log(`[${bin}] API Ninjas Request Fail`);
+    }
+  }
+
+  // АПІ №3: binlist.net (Безкоштовний публічний резерв)
+  if (!resultData) {
+    try {
+      const res = await fetch(`https://lookup.binlist.net/${bin}`, { headers: { 'Accept-Version': '3' } });
+      if (res.ok) {
+        resultData = await res.json();
+        console.log(`[${bin}] Знайдено через binlist`);
+      }
+    } catch (e) {
+      console.log(`[${bin}] binlist Fail`);
+    }
+  }
+
+  // АПІ №4: freebinchecker.com (Безкоштовний публічний резерв)
   if (!resultData || Object.keys(resultData).length === 0) {
     try {
       const res = await fetch(`https://api.freebinchecker.com/bin/${bin}`);
       if (res.ok) {
         const raw = await res.json();
-        // Перевіряємо, чи дійсно є дані, а не просто заглушка
         if (raw.valid && (raw.card || raw.issuer || raw.country)) {
           resultData = {
             scheme: raw.card?.scheme || raw.scheme,
@@ -70,45 +126,20 @@ async function lookupBin(bin) {
             country: { name: raw.country?.name, alpha2: raw.country?.alpha2 },
             bank: { name: raw.issuer?.name || raw.bank?.name, url: raw.issuer?.url || raw.bank?.url, phone: raw.issuer?.phone || raw.bank?.phone }
           };
-          console.log('API 2 (freebinchecker) OK');
+          console.log(`[${bin}] Знайдено через freebinchecker`);
         }
       }
     } catch (e) {
-      console.log('API 2 Fail');
+      console.log(`[${bin}] freebinchecker Fail`);
     }
   }
 
-  // АПІ №3: bininfo.io
-  if (!resultData || Object.keys(resultData).length === 0) {
-    try {
-      const res = await fetch(`https://bininfo.io/bin/${bin}`);
-      if (res.ok) {
-        const raw = await res.json();
-        // Перевіряємо, чи повернулася валідна схема або банк
-        if (raw.bin && (raw.scheme || raw.bank_name || raw.country_code)) {
-          resultData = {
-            scheme: raw.scheme,
-            type: raw.type,
-            brand: raw.brand,
-            prepaid: raw.prepaid === 'Yes' ? true : (raw.prepaid === 'No' ? false : null),
-            country: { name: raw.country_name, alpha2: raw.country_code },
-            bank: { name: raw.bank_name, url: raw.bank_url, phone: raw.bank_phone }
-          };
-          console.log('API 3 (bininfo) OK');
-        }
-      }
-    } catch (e) {
-      console.error('API 3 Fail');
-    }
-  }
-
-  // Якщо всі 3 API відпрацювали, але даних так і немає:
+  // Якщо даних немає ніде (або повернулася пуста відповідь)
   if (!resultData || Object.keys(resultData).length === 0 || (!resultData.scheme && !resultData.bank)) {
-    // НЕ зберігаємо в кеш, щоб при наступному запиті бот спробував ще раз
     return null; 
   }
 
-  // Якщо дані є - зберігаємо в пам'ять
+  // Кешуємо тільки успішні результати
   cache.set(bin, { ts: now, data: resultData });
   return resultData;
 }
